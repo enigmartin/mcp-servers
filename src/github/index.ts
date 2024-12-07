@@ -60,6 +60,111 @@ import {
   type SearchUsersResponse
 } from './schemas.js';
 
+class GitHubAPIError extends Error {
+  constructor(
+    message: string,
+    public status?: number,
+    public method?: string,
+    public path?: string,
+    public response?: any
+  ) {
+    super(message);
+    this.name = 'GitHubAPIError';
+  }
+}
+
+import { Response as FetchResponse } from 'node-fetch';
+
+async function handleGitHubResponse(response: FetchResponse, context: string): Promise<any> {
+  if (!response.ok) {
+    let errorMessage = `GitHub API error (${response.status})`;
+    let errorDetails = '';
+
+    try {
+      const errorData = await response.json();
+      if (typeof errorData === 'object' && errorData !== null && 'message' in errorData) {
+        errorDetails = errorData.message as string;
+      }
+    } catch (e) {
+      errorDetails = response.statusText;
+    }
+
+    switch (response.status) {
+      case 401:
+        throw new GitHubAPIError(
+          `Authentication failed while ${context}: ${errorDetails}`,
+          response.status,
+          response.type,
+          response.url
+        );
+      case 403:
+        if (errorDetails.includes('rate limit exceeded')) {
+          throw new GitHubAPIError(
+            `Rate limit exceeded while ${context}. Please try again later.`,
+            response.status,
+            response.type,
+            response.url
+          );
+        }
+        throw new GitHubAPIError(
+          `Access denied while ${context}: ${errorDetails}`,
+          response.status,
+          response.type,
+          response.url
+        );
+      case 404:
+        throw new GitHubAPIError(
+          `Resource not found while ${context}: ${errorDetails}`,
+          response.status,
+          response.type,
+          response.url
+        );
+      case 422:
+        throw new GitHubAPIError(
+          `Invalid request while ${context}: ${errorDetails}`,
+          response.status,
+          response.type,
+          response.url
+        );
+      default:
+        throw new GitHubAPIError(
+          `${errorMessage} while ${context}: ${errorDetails}`,
+          response.status,
+          response.type,
+          response.url
+        );
+    }
+  }
+
+  try {
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    throw new GitHubAPIError(
+      `Failed to parse GitHub API response while ${context}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      response.status,
+      response.type,
+      response.url
+    );
+  }
+}
+
+function encodeContent(content: string): string {
+  try {
+    return Buffer.from(content).toString('base64');
+  } catch (error) {
+    throw new Error(`Failed to encode content: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+function decodeContent(content: string): string {
+  try {
+    return Buffer.from(content, 'base64').toString('utf8');
+  } catch (error) {
+    throw new Error(`Failed to decode content: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
 const server = new Server(
   {
     name: "github-mcp-server",
@@ -78,6 +183,8 @@ if (!GITHUB_PERSONAL_ACCESS_TOKEN) {
   console.error("GITHUB_PERSONAL_ACCESS_TOKEN environment variable is not set");
   process.exit(1);
 }
+
+
 
 async function forkRepository(
   owner: string,
@@ -270,47 +377,53 @@ async function createOrUpdateFile(
   branch: string,
   sha?: string
 ): Promise<GitHubCreateUpdateFileResponse> {
-  const encodedContent = Buffer.from(content).toString("base64");
+  try {
+    const encodedContent = encodeContent(content);
 
-  let currentSha = sha;
-  if (!currentSha) {
-    try {
-      const existingFile = await getFileContents(owner, repo, path, branch);
-      if (!Array.isArray(existingFile)) {
-        currentSha = existingFile.sha;
+    let currentSha = sha;
+    if (!currentSha) {
+      try {
+        const existingFile = await getFileContents(owner, repo, path, branch);
+        if (!Array.isArray(existingFile)) {
+          currentSha = existingFile.sha;
+        }
+      } catch (error) {
+        console.error("Note: File does not exist in branch, will create new file");
       }
-    } catch (error) {
-      console.error(
-        "Note: File does not exist in branch, will create new file"
-      );
     }
+
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+    const body = {
+      message,
+      content: encodedContent,
+      branch,
+      ...(currentSha ? { sha: currentSha } : {}),
+    };
+
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: {
+        Authorization: `token ${GITHUB_PERSONAL_ACCESS_TOKEN}`,
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "github-mcp-server",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const data = await handleGitHubResponse(response, `creating/updating file ${path}`);
+    return GitHubCreateUpdateFileResponseSchema.parse(data);
+  } catch (error) {
+    if (error instanceof GitHubAPIError) {
+      throw error;
+    }
+    throw new GitHubAPIError(
+      `Failed to create/update file ${path}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      undefined,
+      'PUT',
+      path
+    );
   }
-
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-
-  const body = {
-    message,
-    content: encodedContent,
-    branch,
-    ...(currentSha ? { sha: currentSha } : {}),
-  };
-
-  const response = await fetch(url, {
-    method: "PUT",
-    headers: {
-      Authorization: `token ${GITHUB_PERSONAL_ACCESS_TOKEN}`,
-      Accept: "application/vnd.github.v3+json",
-      "User-Agent": "github-mcp-server",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    throw new Error(`GitHub API error: ${response.statusText}`);
-  }
-
-  return GitHubCreateUpdateFileResponseSchema.parse(await response.json());
 }
 
 async function createTree(
